@@ -1,0 +1,200 @@
+---
+title: "BA810-project"
+author: "Teammates: Dongzhe Zhang, Kunpeng Huang, Chengyu Liang, Haolan Ma, Yihan Jiang, Meiling Zhang"
+date: "10/10/2019"
+output: pdf_document
+---
+
+### Set up
+```{r echo=FALSE}
+library(tidyverse) 
+library(ggthemes) 
+library(randomForest) 
+library(gbm)
+library(MASS)
+library(dplyr)
+library(tidyr)
+theme_set(theme_economist())
+```
+
+### Data Cleaning
+```{r message=F}
+dd <- read_csv("data/application_train.csv")
+```
+
+1. A lot of columns contain missing values. 
+Instead of replacing them with the median, we would take the columns that have more than 40% NA's out.
+```{r}
+# calculate the missing values proportion for each variable
+na_prop <- colSums(is.na(dd)) / nrow(dd)
+# Find the variables that have over 40% missing values
+na_40 <- sort(na_prop[na_prop > 0.4], decreasing = TRUE)
+# remove these columns
+dd <- dd[ ,!names(dd) %in% names(na_40)]
+```
+
+2. There are columns that we don't understanding the meaning of such as `FLAG_DOCUMENT` and `SOCIAL_CIRCLE`. Since we cannot find any additional information about them, we decided to remove these variables as well.
+```{r}
+dd = dd[-grep("FLAG_DOCUMENT",colnames(dd))]
+dd = dd[-grep("SOCIAL_CIRCLE",colnames(dd))]
+```
+
+We also decided to remove any column that contains `CITY` in them since there are other columns that define the applicant's `REGION` and some variables that describe the characteristics of the `REGION`, using `CITY` again seems redundant and overlapping.
+```{r}
+dd = dd[-grep("CITY", colnames(dd))]
+```
+
+Because of the same reason, we decided to remove some of the columns that contain `AMT_REQ_CREDIT_BUREAU`, only keep `AMT_REQ_CREDIT_BUREAU_WEEK` represent short-term count of credit requirements and `AMT_REQ_CREDIT_BUREAU_YEAR` as long_term count of credit requirements.
+
+```{r}
+names = c("AMT_REQ_CREDIT_BUREAU_HOUR", "AMT_REQ_CREDIT_BUREAU_DAY", "AMT_REQ_CREDIT_BUREAU_MON", "AMT_REQ_CREDIT_BUREAU_QRT")
+dd = dd[,-which(names(dd) %in% names) ]
+```
+
+
+3. `DAYS_EMPLOYED` represents the days that the applicant is employed until the application date, which whould be all negative in this dataset. Therefore, the value `365243` in `DAYS_EMPLOYED` column seems unreasonable and we would replace it with 0.
+```{r}
+dd$DAYS_EMPLOYED[which(dd$DAYS_EMPLOYED == 365243)] <- 0
+```
+
+For better understanding of the data, we also need to convert `DAYS_EMPLOYED`, `DAYS_BIRTH`, `DAYS_PUBLISH` and `DAYS_REGISTRATION`, which are all negative in the dataset, to positive number in years.
+```{r}
+dd$DAYS_EMPLOYED[which(dd$DAYS_EMPLOYED == 365243)] <- 0
+dd$DAYS_EMPLOYED = abs(dd$DAYS_EMPLOYED)/365 %>% floor()
+dd$DAYS_BIRTH = abs(dd$DAYS_BIRTH)/365 %>% floor()
+dd$DAYS_ID_PUBLISH = abs(dd$DAYS_ID_PUBLISH)/365 %>% floor()
+dd$DAYS_REGISTRATION = abs(dd$DAYS_REGISTRATION)/365 %>% floor()
+```
+
+4. There are some false entries in `AMT_REQ_CREDIT_BUREAU_WEEK` and `AMT_REQ_CREDIT_BUREAU_YEAR`, so we removed all observations with false entries.
+```{r}
+dd<-dd%>% filter((is.na(AMT_REQ_CREDIT_BUREAU_WEEK)&is.na(AMT_REQ_CREDIT_BUREAU_YEAR))|
+                               (AMT_REQ_CREDIT_BUREAU_WEEK <=AMT_REQ_CREDIT_BUREAU_YEAR))
+```
+
+###########
+remove xna in `CODE_GENDER`
+##########
+```{r}
+dd <- dd %>% filter(CODE_GENDER != "XNA")
+```
+##########
+Set xna in `ORGANIZATION_TYPE` to `not_provide`
+#########
+```{r}
+dd[dd=="XNA"] <- "Not Provided"
+```
+
+
+5. With columns that are left with less than 40% NA's in them, we replaced those NA's with the median of the variable.
+```{r}
+ext2_median <- median(dd$EXT_SOURCE_2, na.rm = TRUE)
+ext3_median <- median(dd$EXT_SOURCE_3, na.rm = TRUE)
+ 
+dd<- dd%>% replace_na(list(EXT_SOURCE_2 = ext2_median, 
+                           EXT_SOURCE_3 = ext3_median))
+
+phonechange_median <- median(dd$DAYS_LAST_PHONE_CHANGE, na.rm = TRUE)
+dd<- dd%>% replace_na(list(DAYS_LAST_PHONE_CHANGE = phonechange_median))
+
+week_median <- median(dd$AMT_REQ_CREDIT_BUREAU_WEEK, na.rm = TRUE)
+year_median <- median(dd$AMT_REQ_CREDIT_BUREAU_YEAR, na.rm = TRUE)
+ 
+dd<- dd%>% replace_na(list(AMT_REQ_CREDIT_BUREAU_WEEK = week_median, 
+                           AMT_REQ_CREDIT_BUREAU_YEAR = year_median))
+```
+
+annuity to 0
+```{r}
+dd$AMT_ANNUITY[is.na(dd$AMT_ANNUITY)] <- 0
+```
+
+amount good price 0
+```{r}
+dd$AMT_GOODS_PRICE[is.na(dd$AMT_GOODS_PRICE)] <- 0
+```
+
+family members
+```{r}
+unknow_status = which(is.na(dd$CNT_FAM_MEMBERS))
+dd = dd[-unknow_status,]
+```
+
+##################
+set na as "not_provided" level
+##################
+
+```{r}
+dd[is.na(dd)] <- "Not Provided"
+```
+
+##############
+factorize
+##############
+```{r}
+dd <- as.data.frame(unclass(dd))
+```
+
+
+### Exploratory Data Analysis
+Before we go ahead to build different models for our dataset, we need to take a look at the data that we have.
+```{r}
+ggplot(dd)+
+  geom_bar(aes(x=TARGET,col=TARGET))+
+  scale_x_discrete(limits=c(0,1))
+```
+From this graph we can see that the proportion of default(1) and not default(0) are highly different. Therefore, when we separate the dataset into train and test datasets, we need to make sure that the there are enough default(1) in both train and test datasets. Therefore, we would randomly select 20% from 0 and 1 as the test dataset.
+
+```{r}
+set.seed(7)
+dd_default = dd %>% filter(TARGET==1)
+dd_default %>% 
+  mutate(TRAIN = sample(c(0,1),nrow(dd_default),replace=T,prob=c(0.2,0.8))) ->dd_default
+
+dd_not_default = dd %>% filter(TARGET == 0)
+dd_not_default %>% 
+  mutate(TRAIN = sample(c(0,1),nrow(dd_not_default),replace=T,prob=c(0.2,0.8))) ->dd_not_default
+
+dd_clean = rbind(dd_default,dd_not_default)
+
+application_train = dd_clean[which(dd_clean$TRAIN==1),]
+application_test = dd_clean[which(dd_clean$TRAIN==0),]
+
+saveRDS(application_train,file="application_train.rds")
+saveRDS(application_test,file="application_test.rds")
+```
+Creste dummy variables
+```{r}
+dmy <- dummyVars(formula = ~., data = application_train, fullRank = TRUE)
+dummy_train <- data.frame(predict(dmy, newdata = application_train))
+
+dmy <- dummyVars(formula = ~., data = application_test, fullRank = TRUE)
+dummy_test <- data.frame(predict(dmy, newdata = application_test))
+
+saveRDS(dummy_test, file = "dummy_test.rds")
+saveRDS(dummy_train, file = "dummy_train.rds")
+
+```
+
+
+
+### Forward Selection
+After fitting all the variables to the linear regression, we want to select the best predictors that are most important to the prediction.
+We would start by using `Forward Selection`.
+First we started with the simplest model that only contains the intercept
+```{r}
+fit_bw = lm(TARGET~., data = application_train)
+```
+
+Then we use the function `stepAIC()` to do forward selection.
+
+
+
+
+
+
+
+
+
+
+
